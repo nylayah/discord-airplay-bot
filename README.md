@@ -14,12 +14,42 @@ The bot also exposes the currently playing song and artist through Discord.
 
 ## Requirements
 
-* macOS
-* Node.js
-* Rust and Cargo
-* FFmpeg
-* A Discord bot application
-* An AirPlay-compatible device
+- macOS
+- Node.js 22 or newer
+- Rust and Cargo
+- FFmpeg
+- A Discord bot application
+- An AirPlay-compatible device
+
+### Installing prerequisites
+
+### Installing prerequisites
+
+The easiest way to install the required development tools is with Homebrew.
+
+If you do not already have Homebrew, install it from the official Homebrew website.
+
+Then install FFmpeg and Rust:
+
+```bash
+brew install ffmpeg rust
+```
+
+Node.js can be installed through Homebrew:
+
+```bash
+brew install node
+```
+
+Verify the tools are available:
+
+```bash
+node --version
+cargo --version
+ffmpeg -version
+```
+
+The setup script automatically detects the installed paths for FFmpeg and Cargo.
 
 ## Installation
 
