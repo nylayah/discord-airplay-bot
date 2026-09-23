@@ -163,17 +163,45 @@ try {
         }
     );
 
-    console.log('LaunchAgent is already loaded. Restarting it...');
+    console.log('LaunchAgent is already loaded. Leaving it running.');
 
-    execFileSync(
-        'launchctl',
-        ['kickstart', '-k', launchctlTarget],
-        {
-            stdio: 'inherit'
-        }
-    );
+    console.log('Verifying LaunchAgent...');
 
-    console.log('LaunchAgent restarted successfully.');
+    try {
+        execFileSync(
+            'launchctl',
+            ['print', launchctlTarget],
+            {
+                stdio: 'ignore'
+            }
+        );
+
+        console.log('LaunchAgent verification passed.');
+    } catch {
+        console.error(
+            'LaunchAgent is loaded, but verification failed.'
+        );
+        process.exit(1);
+    }
+
+    console.log('Verifying LaunchAgent...');
+
+    try {
+        execFileSync(
+            'launchctl',
+            ['print', launchctlTarget],
+            {
+                stdio: 'ignore'
+            }
+        );
+
+        console.log('LaunchAgent verification passed.');
+    } catch {
+        console.error(
+            'LaunchAgent was restarted, but verification failed.'
+        );
+        process.exit(1);
+    }
 } catch {
     console.log('LaunchAgent is not loaded. Loading it...');
 
@@ -187,6 +215,23 @@ try {
         );
 
         console.log('LaunchAgent loaded successfully.');
+        console.log('Verifying LaunchAgent...');
+
+        try {
+            execFileSync(
+                'launchctl',
+                ['print', launchctlTarget],
+                {
+                    stdio: 'ignore'
+                }
+            );
+            console.log('LaunchAgent verification passed.');
+        } catch {
+            console.error(
+                'LaunchAgent was loaded, but verification failed.'
+            );
+            process.exit(1);
+        }
     } catch {
         console.error(
             'Failed to load the LaunchAgent. Please check the launchctl output above.'
