@@ -1,0 +1,78 @@
+# Release: pushing a v* tag publishes the workspace's crates to crates.io.
+#
+# Authentication is crates.io Trusted Publishing (GitHub OIDC): no API
+# token is stored in the repo. One-time setup and the full release
+# procedure live in runbooks/releasing.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # for crates.io Trusted Publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Check every crate is at the tagged version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mismatch=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg v "$version" \
+              '.packages[] | select(.version != $v) | "\(.name) \(.version)"')
+          if [ -n "$mismatch" ]; then
+            echo "tag $GITHUB_REF_NAME, but these crates say otherwise:" >&2
+            echo "$mismatch" >&2
+            exit 1
+          fi
+          echo "releasing $version"
+      - name: Test before publishing
+        run: cargo test --workspace
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      # Dependency order: the two leaf crates first, then the two that
+      # depend on them — cargo verifies a dependent against the registry,
+      # not the workspace, and waits for the index to catch up.
+      #
+      # Each crate is skipped if that version is already up, which makes a
+      # re-pushed tag safe after a partial failure, and lets a crate that
+      # had to be published by hand (a brand-new crate, which cannot have a
+      # trusted publisher until it exists) pass through untouched.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          for crate in openairplay1 openairplay1-dashboard-protocol \
+                       openairplay1-receiver openairplay1-dashboard; do
+            echo "== publishing $crate"
+            if output=$(cargo publish -p "$crate" 2>&1); then
+              echo "$output"
+              continue
+            fi
+            echo "$output"
+            # A version already on the registry is the expected outcome of a
+            # re-pushed tag, and of a brand-new crate that had to be published
+            # by hand (crates.io cannot grant a trusted publisher to a crate
+            # that does not exist yet). Anything else is a real failure.
+            #
+            # Cargo is asked rather than the crates.io API on purpose: a plain
+            # HEAD to the API answers 403, so an HTTP check silently reported
+            # "not published" for everything and this step then died on the
+            # first crate that was already up.
+            if echo "$output" | grep -q "already exists on crates.io index"; then
+              echo "== $crate is already at this version, continuing"
+              continue
+            fi
+            exit 1
+          done

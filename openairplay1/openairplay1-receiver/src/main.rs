@@ -1,0 +1,295 @@
+//! The standalone Linux/ALSA AirPlay 1 receiver: a CLI over the
+//! `openairplay1` library's public API (it is embedder #1), with an ALSA
+//! sink and the dB → linear gain volume model.
+
+use std::process::ExitCode;
+use log::{debug, info, warn};
+use std::process::{Child, Command, Stdio};
+
+mod dashboard;
+mod player;
+
+use crate::player::{volume_to_gain, NullSink, PipeSink, SharedGain};
+use openairplay1::{AudioSink, Event, Receiver};
+
+
+struct Args {
+    /// `None` → the library's defaults (name "OpenAirPlay", port 5000).
+    name: Option<String>,
+    port: Option<u16>,
+    mac: Option<[u8; 6]>,
+    avahi: bool,
+    /// Audio pipe, or `None` for `--no-audio`.
+    audio_pipe: Option<String>,    /// Where log output goes; stderr when `None`.
+    log_file: Option<String>,
+    /// Address to serve the dashboard WebSocket on; off when `None`.
+    dashboard_listen: Option<String>,
+    /// Require this password to stream; `None` → open.
+    password: Option<String>,
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: openairplay1-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
+         [--alsa-device DEV] [--no-audio] [--no-avahi] [--log-file PATH] \
+         [--dashboard-listen ADDR] [--password CODE]"
+    );
+    std::process::exit(2);
+}
+
+/// Parse the `--mac` argument, e.g. `aa:bb:cc:dd:ee:ff`.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut parts = s.trim().split(':');
+    for byte in &mut mac {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
+fn parse_args() -> Args {
+    let mut args = Args {
+        name: None,
+        port: None,
+        mac: None,
+        avahi: true,
+        audio_pipe: Some("/tmp/airplay_pipe".to_string()),
+        log_file: None,
+        dashboard_listen: None,
+        password: None,
+    };
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--name" => args.name = Some(it.next().unwrap_or_else(|| usage())),
+            "--port" => {
+                args.port = Some(
+                    it.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                )
+            }
+            "--mac" => {
+                args.mac = Some(
+                    it.next()
+                        .as_deref()
+                        .and_then(parse_mac)
+                        .unwrap_or_else(|| usage()),
+                )
+            }
+            "--audio-pipe" => args.audio_pipe = Some(it.next().unwrap_or_else(|| usage())),
+            "--no-audio" => args.audio_pipe = None,
+            "--log-file" => args.log_file = Some(it.next().unwrap_or_else(|| usage())),
+            "--dashboard-listen" => {
+                args.dashboard_listen = Some(it.next().unwrap_or_else(|| usage()))
+            }
+            "--password" => args.password = Some(it.next().unwrap_or_else(|| usage())),
+            "--no-avahi" => args.avahi = false,
+            "-h" | "--help" => usage(),
+            other => {
+                eprintln!("unknown argument: {other}");
+                usage();
+            }
+        }
+    }
+    args
+}
+
+/// Point the logger at the right sink: `--log-file` if given, else stderr.
+fn init_logging(args: &Args) -> Result<(), String> {
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    if let Some(path) = &args.log_file {
+        let file = std::fs::File::create(path)
+            .map_err(|e| format!("cannot write log file {path:?}: {e}"))?;
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+    builder.init();
+    Ok(())
+}
+
+/// One line per event, at debug: with a sender streaming these arrive
+/// several times a second, and the receiver's `info` log is meant to stay
+/// readable — the dashboard is where now-playing detail belongs.
+fn log_event(event: Event) {
+    match event {
+        Event::SessionStarted {
+            rate,
+            channels,
+            peer,
+            ..
+        } => debug!("session started ({rate} Hz, {channels}ch) from {peer}"),
+        Event::Progress { elapsed, duration } => debug!(
+            "progress {:.0}s / {:.0}s",
+            elapsed.as_secs_f32(),
+            duration.as_secs_f32()
+        ),
+        Event::Metadata {
+            title,
+            artist,
+            album,
+        } => {
+            let unknown = || "?".to_string();
+            debug!(
+                "now playing: {} — {} ({})",
+                artist.unwrap_or_else(unknown),
+                title.unwrap_or_else(unknown),
+                album.unwrap_or_else(unknown)
+            );
+        }
+        Event::Artwork { content_type, data } => {
+            if data.is_empty() {
+                debug!("artwork cleared ({content_type})");
+            } else {
+                debug!("artwork: {content_type}, {} bytes", data.len());
+            }
+        }
+        Event::SessionEnded => debug!("session ended"),
+        Event::Flushed => debug!("flushed"),
+        // Volume is logged where the gain is applied.
+        _ => {}
+    }
+}
+
+fn register_bonjour(receiver: &Receiver) -> Option<Child> {
+    let config = receiver.config();
+
+    let service_name = config.service_name();
+    let txt = openairplay1::txt_records(config.password.as_deref());
+
+    let mut command = Command::new("dns-sd");
+    command
+        .arg("-P")
+        .arg(&service_name)
+        .arg("_raop._tcp")
+        .arg("local")
+        .arg(config.port.to_string())
+        .arg("Discord-AirPlay.local")
+        .arg("10.0.0.2");
+
+    for record in &txt {
+        command.arg(record);
+    }
+
+    match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            info!("Bonjour advertisement registered as \"{}\"", service_name);
+            Some(child)
+        }
+        Err(e) => {
+            warn!("could not register Bonjour advertisement: {e}");
+            None
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args = parse_args();
+    if let Err(e) = init_logging(&args) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut builder = Receiver::builder().advertise(false);
+    if let Some(name) = args.name {
+        builder = builder.name(name);
+    }
+    if let Some(port) = args.port {
+        builder = builder.port(port);
+    }
+    if let Some(mac) = args.mac {
+        builder = builder.mac(mac);
+    }
+    if let Some(password) = args.password {
+        builder = builder.password(password);
+    }
+    let receiver = match builder.build() {
+        Ok(receiver) => receiver,
+        Err(e) => {
+            eprintln!("cannot build the receiver: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let _bonjour = register_bonjour(&receiver);
+    
+    info!(
+        "starting AirPlay 1 receiver \"{}\" (mac {}, rtsp port {})",
+        receiver.config().name,
+        receiver.config().mac_hex(),
+        receiver.config().port
+    );
+    // The password is a secret: say whether protection is on, never the value.
+    match &receiver.config().password {
+        Some(_) => info!("password protection: enabled"),
+        None => info!("password protection: disabled"),
+    }
+    match &args.audio_pipe {
+        Some(path) => info!("audio output: pipe \"{path}\""),
+        None => info!("audio output: disabled (--no-audio)"),
+    }
+
+    let gain = SharedGain::new();
+    let sink_gain = gain.clone();
+    let audio_pipe = args.audio_pipe;
+
+    let sink_factory = move |_rate: u32, _channels: u8| -> Box<dyn AudioSink> {
+        match &audio_pipe {
+            Some(path) => Box::new(PipeSink::open(path, sink_gain.clone())),
+            None => Box::new(NullSink),
+        }
+    };
+    // Serve the dashboard socket, if asked for. Bind before streaming starts
+    // so a bad address fails at startup rather than at the first sender.
+    let publisher = match &args.dashboard_listen {
+        Some(addr) => {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("cannot listen for dashboards on {addr}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            info!("dashboard endpoint: ws://{addr}");
+            let publisher = dashboard::Publisher::new(receiver.config().name.clone());
+            tokio::spawn(dashboard::serve(listener, publisher.clone()));
+            Some(publisher)
+        }
+        None => None,
+    };
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Events drive our gain (always), the dashboard socket (when serving),
+    // and the log.
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            if let Event::Volume { db } = &event {
+                debug!("volume {db} dB");
+                gain.set(volume_to_gain(*db));
+            }
+            if let Some(publisher) = &publisher {
+                publisher.publish(&event);
+            }
+            log_event(event);
+        }
+    });
+
+    tokio::select! {
+        result = receiver.run(sink_factory, event_tx) => {
+            if let Err(e) = result {
+                eprintln!("server error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutting down");
+        }
+    }
+    ExitCode::SUCCESS
+}
