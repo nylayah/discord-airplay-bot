@@ -3,6 +3,16 @@ const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
 
+if (process.platform !== 'darwin') {
+    console.error('Discord AirPlay setup currently supports macOS only.');
+    process.exit(1);
+}
+
+if (process.arch !== 'arm64' && process.arch !== 'x64') {
+    console.error(`Unsupported Mac architecture: ${process.arch}`);
+    process.exit(1);
+}
+
 const PROJECT_PATH = path.resolve(__dirname, '..');
 const HOME = os.homedir();
 
@@ -41,6 +51,7 @@ function setEnvValue(filePath, key, value) {
 
     fs.writeFileSync(filePath, content);
 }
+
 const cargoPath = findCommand('cargo');
 
 console.log(`Node:    ${nodePath}`);
@@ -50,7 +61,7 @@ if (ffmpegPath) {
     setEnvValue(envPath, 'FFMPEG_PATH', ffmpegPath);
 } else {
     console.error(
-        'FFmpeg was not found. Please install FFmpeg before continuing.'
+        'FFmpeg was not found. Install it with "brew install ffmpeg", then run npm run setup again.'
     );
     process.exit(1);
 }
